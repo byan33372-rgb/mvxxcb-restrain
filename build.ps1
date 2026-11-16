@@ -2,7 +2,7 @@
 # Requires .NET 8 SDK. No-admin install (per-user):
 #   irm https://dot.net/v1/dotnet-install.ps1 -OutFile dotnet-install.ps1
 #   .\dotnet-install.ps1 -Channel 8.0   # installs to %LOCALAPPDATA%\Microsoft\dotnet
-param([string]$Version = '0.3.0')
+param([string]$Version = '0.4.5')
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dotnet = @('D:\dev\dotnet\dotnet.exe', (Join-Path $env:LOCALAPPDATA 'Microsoft\dotnet\dotnet.exe')) | Where-Object { Test-Path $_ } | Select-Object -First 1
