@@ -31,6 +31,20 @@ public sealed class SchedulerOptions
 
     /// <summary>Seconds to wait before retrying a failed throttle attempt.</summary>
     public double RetryAfterFailSeconds { get; init; } = 5;
+
+    /// <summary>
+    /// Sticky mode: after this many throttle events for one target, quiet probe
+    /// windows re-arm the throttle instead of declaring "scan ended", until
+    /// QuietProbesBeforeRelease consecutive quiet probes prove the scanner is
+    /// done. Field data (2026-11): SGuard64 re-bursts 2-60s after every
+    /// release, so per-burst release cycles leaked a full-rate window each
+    /// time. A finished scan is still released within ~ProbeSec x
+    /// QuietProbesBeforeRelease extra seconds.
+    /// </summary>
+    public int StickyAfterThrottles { get; init; } = 3;
+
+    /// <summary>Consecutive quiet probe windows required to release a sticky target.</summary>
+    public int QuietProbesBeforeRelease { get; init; } = 2;
 }
 
 public sealed record SchedulerEvent(DateTimeOffset Timestamp, string Kind, double RateMBps, string Detail);
@@ -55,6 +69,8 @@ public sealed class SchedulerStateMachine
     private SchedulerState _state = SchedulerState.Idle;
     private int _burstRun;
     private int _quietRun;
+    private int _throttleCount; // initial throttles - drives sticky mode
+    private int _quietProbeRun; // consecutive quiet probe windows (sticky release)
     private double _throttledSeconds;
     private DateTimeOffset _lastTs;
     private double _lastBytes;
@@ -151,9 +167,10 @@ public sealed class SchedulerStateMachine
             case SchedulerState.Probe:
                 if (mbps >= _options.BurstMBs)
                 {
+                    _quietProbeRun = 0;
                     if (busy && InBackoff(now) is false)
                     {
-                        if (TryThrottle(now, mbps, "probe: still scanning, foreground busy"))
+                        if (TryThrottle(now, mbps, "probe: still scanning, foreground busy", "rethrottle"))
                             _state = SchedulerState.Throttled;
                     }
                     else if (!busy)
@@ -164,10 +181,35 @@ public sealed class SchedulerStateMachine
                         _log(new SchedulerEvent(now, "passthrough", mbps, "probe: still scanning, desktop idle - released"));
                     }
                 }
+                else if (busy && InBackoff(now) is false
+                         && _throttleCount >= _options.StickyAfterThrottles)
+                {
+                    // Sticky mode: a quiet probe window after recent bursts does
+                    // NOT mean the scan is over - the field data shows the
+                    // scanner re-bursts seconds after every release. Re-arm the
+                    // throttle and keep probing; release only after
+                    // QuietProbesBeforeRelease consecutive quiet windows.
+                    _quietProbeRun++;
+                    if (_quietProbeRun >= _options.QuietProbesBeforeRelease)
+                    {
+                        var quietProbes = _quietProbeRun;
+                        _state = SchedulerState.Idle;
+                        _burstRun = 0;
+                        _quietProbeRun = 0;
+                        LastError = null;
+                        _log(new SchedulerEvent(now, "release", mbps,
+                            $"probe: scan ended (sticky released after {quietProbes} quiet probes)"));
+                    }
+                    else if (TryThrottle(now, mbps, "sticky: recent bursts, foreground busy - re-armed throttle window", "rethrottle"))
+                    {
+                        _state = SchedulerState.Throttled;
+                    }
+                }
                 else
                 {
                     _state = SchedulerState.Idle;
                     _burstRun = 0;
+                    _quietProbeRun = 0;
                     LastError = null; // scan ended cleanly - stale errors no longer apply
                     _log(new SchedulerEvent(now, "release", mbps, "probe: scan ended"));
                 }
@@ -179,7 +221,7 @@ public sealed class SchedulerStateMachine
 
     private bool InBackoff(DateTimeOffset now) => (now - _lastFailTs).TotalSeconds < _options.RetryAfterFailSeconds;
 
-    private bool TryThrottle(DateTimeOffset now, double mbps, string detail)
+    private bool TryThrottle(DateTimeOffset now, double mbps, string detail, string kind = "throttle")
     {
         var err = _applyThrottle(true);
         if (err != null)
@@ -193,7 +235,9 @@ public sealed class SchedulerStateMachine
         _throttledSeconds = 0;
         _burstRun = 0;
         _quietRun = 0;
-        _log(new SchedulerEvent(now, "throttle", mbps, detail));
+        _quietProbeRun = 0;
+        if (kind == "throttle") _throttleCount++;
+        _log(new SchedulerEvent(now, kind, mbps, detail));
         return true;
     }
 }

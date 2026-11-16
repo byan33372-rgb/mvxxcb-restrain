@@ -81,6 +81,50 @@ public static class ProcessThrottle
     }
 
     /// <summary>
+    /// Enable SeDebugPrivilege on this process token. When running elevated
+    /// this lets OpenProcess bypass the (restricted) DACL of SYSTEM-level
+    /// scanner processes - field data showed ACE-Service64 denied observation
+    /// in every elevated session without it. Returns false with the win32
+    /// error text when the privilege is unavailable (e.g. not elevated).
+    /// </summary>
+    public static bool EnableDebugPrivilege(out string? error)
+    {
+        error = null;
+        if (!OpenProcessToken(GetCurrentProcess(), TokenQuery | TokenAdjustPrivileges, out var token))
+        {
+            error = $"OpenProcessToken err {Marshal.GetLastWin32Error()}";
+            return false;
+        }
+        try
+        {
+            if (!LookupPrivilegeValue(null, "SeDebugPrivilege", out var luid))
+            {
+                error = $"LookupPrivilegeValue err {Marshal.GetLastWin32Error()}";
+                return false;
+            }
+            var tp = new TokenPrivileges { PrivilegeCount = 1, Luid = luid, Attributes = SePrivilegeEnabled };
+            if (!AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero))
+            {
+                error = $"AdjustTokenPrivileges err {Marshal.GetLastWin32Error()}";
+                return false;
+            }
+            // AdjustTokenPrivileges succeeds even when the privilege could not
+            // be assigned; GetLastError then reports ERROR_NOT_ALL_ASSIGNED.
+            var last = Marshal.GetLastWin32Error();
+            if (last != 0)
+            {
+                error = $"privilege not assigned (err {last}) - not elevated?";
+                return false;
+            }
+            return true;
+        }
+        finally
+        {
+            CloseHandle(token);
+        }
+    }
+
+    /// <summary>
     /// Best-effort release before dropping a target. Only a confirmed
     /// restore or a confirmed death may discard the snapshot; anything else
     /// (access denied, partial restore) keeps it journaled so the next
@@ -296,6 +340,16 @@ public static class ProcessThrottle
             return FailWithRollback($"SetPriorityClass Idle failed (err {Marshal.GetLastWin32Error()})");
         if (snap.IoPriority.HasValue && SetIoPriority(handle, 0 /* VeryLow */) is { } ioErr)
             return FailWithRollback($"SetIoPriority VeryLow failed: {ioErr}");
+        // verify the IO priority actually landed when the process lets us query it
+        if (snap.IoPriority.HasValue && QueryIoPriority(handle) is { } ioNow && ioNow != 0)
+            return FailWithRollback($"verify failed: IO priority readback {ioNow}, expected 0 (VeryLow)");
+        // Pin to CORE 0, deliberately. On an unsaturated NVMe the IO-priority
+        // hint barely bites and a single-threaded scanner gets a full core
+        // wherever we put it - measured on this machine: highest-core pinning
+        // left the dummy at FULL throughput (trial c2 ratio 1.08) because
+        // nothing competes there; core 0 shares DPC/interrupt/foreground
+        // housekeeping, which is what actually starves the scanner (c2 ratio
+        // 0.40). The "quietest core" is the wrong core for suppression.
         if (!SetProcessAffinityMask(handle, (IntPtr)1))
             return FailWithRollback($"SetProcessAffinityMask failed (err {Marshal.GetLastWin32Error()})");
 
@@ -585,4 +639,35 @@ public static class ProcessThrottle
 
     [DllImport("ntdll.dll")]
     private static extern int NtQueryInformationProcess(IntPtr hProcess, int infoClass, ref int info, int length, out int returnLength);
+
+    // ---------------- SeDebugPrivilege ----------------
+
+    private const uint TokenQuery = 0x0008;
+    private const uint TokenAdjustPrivileges = 0x0020;
+    private const uint SePrivilegeEnabled = 0x0002;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Luid
+    {
+        public uint LowPart;
+        public int HighPart;
+    }
+
+    // TOKEN_PRIVILEGES with exactly one LUID_AND_ATTRIBUTES entry, laid out flat
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TokenPrivileges
+    {
+        public uint PrivilegeCount;
+        public Luid Luid;
+        public uint Attributes;
+    }
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool LookupPrivilegeValue(string? systemName, string privilegeName, out Luid luid);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool AdjustTokenPrivileges(IntPtr tokenHandle, bool disableAllPrivileges, ref TokenPrivileges newState, uint bufferLength, IntPtr previousState, IntPtr returnLength);
 }

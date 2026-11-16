@@ -74,23 +74,24 @@ public static class FeedbackExport
             会话选择: {reason}
             提示: summary.txt 是累计追加的,按会话时间找本次段落; selected/session-*.jsonl 是本次完整时间线。
 
-            默认调度参数: 突发阈值 5 MB/s(连续 2 次采样确认) / 限速持续 5s 后开探测窗 / 采样间隔 500ms / 判活 10 次无样本(约 5s) / 重收养冷却 15s / 观测被拒退避 600s
+            默认调度参数: 突发阈值 5 MB/s(连续 2 次采样确认) / 限速持续 5s 后开探测窗 / sticky 模式(初限 3 次后,探测窗静默改为再限速,连续 2 个静默探测窗才解除) / 采样间隔 500ms / 判活 10 次无样本(约 5s) / 重收养冷却 15s / 观测被拒退避: 提权 30s,非提权 600s
 
             文件说明:
               selected/session-*.jsonl  本次会话完整时间线(下述事件流)
               selected/summary.txt      中文人读总结(所有会话累计)
-              support/                  运行日志与配置现场(前台进程清单、开关状态)
+              support/                  运行日志与配置现场(前台进程清单、游戏清单、开关状态)
               history/                  更早的会话记录(对比用)
 
-            JSONL 事件速查(kind 字段):
+            JSONL 事件速查(evt 字段):
               session-start | session-summary   会话开始/总结落盘
               scanner-found pid= name=          发现并收养扫描进程
               scanner-gone  pid=                扫描进程消失
               rate          pid= mbps= state=   速率样本(突发时每拍 + 空闲 10s 心跳) state: Idle/BurstIdle/Throttled/Probe
-              scheduler-throttle/probe/release/rethrottle(=probe 后再限速)/passthrough(桌面空闲放行)/throttle-failed/restore-failed
-              observe-denied pid=               采样被拒(权限不足)
+              scheduler-throttle/probe/release/passthrough(桌面空闲放行)/throttle-failed/restore-failed
+              scheduler-rethrottle              探测窗后再限速(扫描仍在进行,或 sticky 再武装)
+              observe-denied pid=               采样被拒(权限不足,进程仍存活)
               fg-busy/fg-idle                    前台忙/闲切换(清单命中或全屏)
-              game-start/game-exit 进程名        游戏进程出现/退出
+              game-start/game-exit 进程名        games.txt 清单中的游戏进程出现/退出
             """;
         var readmeEntry = zip.CreateEntry("README.txt");
         using (var w = new StreamWriter(readmeEntry.Open()))

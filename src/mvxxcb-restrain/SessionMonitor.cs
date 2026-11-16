@@ -19,7 +19,8 @@ public sealed class SessionMonitor
         public string Name = "";
         public double EstReadMB;
         public double PeakMBps;
-        public int Throttles;
+        public int Throttles;     // initial throttle applies (burst detected)
+        public int Rethrottles;   // probe-window re-applies (still scanning / sticky re-arm)
         public int Releases;
         public int Passthroughs;
         public int Samples;
@@ -117,6 +118,8 @@ public sealed class SessionMonitor
     private static string J(DateTimeOffset t, string evt, string detail = "") =>
         "{\"ts\":\"" + t.ToString("o") + "\",\"evt\":\"" + evt + "\",\"detail\":\"" + detail.Replace("\"", "'") + "\"}";
 
+    private int _appendFailures; // timeline lines lost to write errors; surfaced in the summary
+
     private void Append(string evt, string detail)
     {
         try
@@ -126,7 +129,12 @@ public sealed class SessionMonitor
             if (file is not null)
                 File.AppendAllText(file, J(DateTimeOffset.Now, evt, detail) + Environment.NewLine);
         }
-        catch { }
+        catch
+        {
+            // a failed timeline line must not break the caller, but it must
+            // not vanish silently either - the summary reports the count
+            lock (_gate) _appendFailures++;
+        }
     }
 
     public void ScannerFound(int pid, string name, DateTimeOffset now)
@@ -188,6 +196,13 @@ public sealed class SessionMonitor
         lock (_gate)
         {
             if (!_scans.TryGetValue(pid, out var s)) return;
+            // Count only samples denied while the process still EXISTS: the
+            // remaining null streak after a death is "gone", not "denied",
+            // and the summary must not bill a 2-second ACE-Service64 with 10
+            // denials (field report 2026-11-17). GetProcessById is an
+            // existence query, safe for protected processes.
+            try { Process.GetProcessById(pid).Dispose(); }
+            catch { return; }
             s.DeniedSamples++;
             if ((now - s.LastDenyLog).TotalSeconds >= 30)
             {
@@ -204,7 +219,8 @@ public sealed class SessionMonitor
         {
             if (_scans.TryGetValue(pid, out var s))
             {
-                if (kind is "throttle" or "rethrottle") s.Throttles++;
+                if (kind == "throttle") s.Throttles++;
+                if (kind == "rethrottle") s.Rethrottles++;
                 if (kind is "release" or "scan-ended") s.Releases++;
                 if (kind is "passthrough") s.Passthroughs++;
             }
@@ -308,6 +324,7 @@ public sealed class SessionMonitor
             _fgLastTick = null; _fgBusySeconds = 0; _fgTotalSeconds = 0; _finished.Clear();
             _gamesPresent.Clear(); // a fresh session must re-observe game-start
             _fgFullscreen = false; // ...and must re-observe fg-busy
+            _appendFailures = 0; // ...and start the write-failure count from zero
         }
     }
 
@@ -324,18 +341,20 @@ public sealed class SessionMonitor
             _fgLastTick = null; _fgBusySeconds = 0; _fgTotalSeconds = 0; _finished.Clear();
             _gamesPresent.Clear(); // a fresh session must re-observe game-start
             _fgFullscreen = false; // ...and must re-observe fg-busy
+            _appendFailures = 0; // ...and start the write-failure count from zero
         }
     }
 
     private void WriteSummary(DateTimeOffset now, string reason = "scanner quiet for 2 minutes")
     {
         TrackedScan[] scans; DateTimeOffset? start, gameExit, gameStart; DateTimeOffset? lastSeen;
-        double fgBusy, fgTotal; bool elevated;
+        double fgBusy, fgTotal; bool elevated; int appendFailures;
         lock (_gate)
         {
             scans = _scans.Values.Concat(_finished).ToArray();
             start = _sessionStart; gameExit = _gameExitAt; gameStart = _gameStartAt; lastSeen = _lastScanSeen;
             fgBusy = _fgBusySeconds; fgTotal = _fgTotalSeconds; elevated = _elevated;
+            appendFailures = _appendFailures;
         }
         var sb = new StringBuilder();
         sb.AppendLine("==================================================");
@@ -355,12 +374,18 @@ public sealed class SessionMonitor
         }
         if (fgTotal > 10)
             sb.AppendLine($"前台全屏时间占比: {fgBusy / fgTotal:P0}（{fgBusy / 60:F0}/{fgTotal / 60:F0} 分钟）");
-        sb.AppendLine($"本次调度: 限速施加 {scans.Sum(s => s.Throttles)} 次（累计 {scans.Sum(s => s.ThrottledSeconds) / 60:F1} 分钟）, 解除 {scans.Sum(s => s.Releases)} 次, 空闲放行 {scans.Sum(s => s.Passthroughs)} 次");
+        // 施加 = 初限 + 再限; rethrottle 单列, 否则 "施加 18/解除 13" 会像
+        // 泄漏了 5 次没恢复 (field report 2026-11-17)
+        var th = scans.Sum(s => s.Throttles);
+        var re = scans.Sum(s => s.Rethrottles);
+        sb.AppendLine($"本次调度: 限速施加 {th + re} 次（初限 {th} / 再限 {re}，累计 {scans.Sum(s => s.ThrottledSeconds) / 60:F1} 分钟）, 解除 {scans.Sum(s => s.Releases)} 次, 空闲放行 {scans.Sum(s => s.Passthroughs)} 次");
         foreach (var s in scans)
         {
             sb.AppendLine($"  - {s.Name}: 活跃 {s.FirstSeen:HH:mm:ss}→{s.LastSeen:HH:mm:ss}, 估算读取 {s.EstReadMB / 1024:F2} GB, 峰值 {s.PeakMBps:F0} MB/s, 采样 {s.Samples} 次/被拒 {s.DeniedSamples} 次");
         }
         sb.AppendLine($"磁盘状态: {DiskStatusLine()}");
+        if (appendFailures > 0)
+            sb.AppendLine($"⚠ 本会话有 {appendFailures} 条事件写盘失败（时间线不完整）");
         sb.AppendLine($"明细时间线: {Path.GetFileName(VolatileFile)}");
         sb.AppendLine();
         try

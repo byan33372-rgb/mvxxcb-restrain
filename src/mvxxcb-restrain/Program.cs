@@ -38,6 +38,15 @@ ToolStripMenuItem toggleItem = null!;
 bool elevated = SessionMonitor.IsElevated();
 monitor.SetElevated(elevated);
 FileLogger.Write($"running elevated: {elevated}");
+if (elevated)
+{
+    // SeDebugPrivilege lets OpenProcess bypass the restricted DACL of
+    // SYSTEM-level scanners (field: ACE-Service64 was denied in EVERY
+    // elevated session without it - sampled 2-4 times, denied 10).
+    FileLogger.Write(ProcessThrottle.EnableDebugPrivilege(out var privErr)
+        ? "SeDebugPrivilege enabled - SYSTEM-level scanners become observable"
+        : $"SeDebugPrivilege unavailable: {privErr}");
+}
 
 // config directory + foreground identity list (user-editable, ships empty)
 var configDir = Path.Combine(
@@ -113,6 +122,10 @@ void LogEvent(int pid, SchedulerEvent ev)
 const int NullStreakLimit = 10;      // ~5s of unreadable IO counters = gone
 const double ReadoptCooldownSec = 15; // same pid must stay gone this long before re-adoption
 const double DeniedCooldownSec = 600; // never successfully sampled = observation denied; long backoff
+const double DeniedCooldownElevatedSec = 30; // elevated: a denied start is usually a transient DACL
+                                             // setup window (SGuard64 denies for ~5s after spawn, then
+                                             // observes fine) - field data showed the 600s backoff left
+                                             // the game's opening scan completely unobserved
 
 /// <summary>
 /// Liveness is sampler-based: a target is dead only when its IO counters are
@@ -193,9 +206,11 @@ void RetargetIfNeeded(DateTimeOffset now)
             var (outcome, err) = ProcessThrottle.TryRecoverBeforeForget(pid, name, fullMask);
             if (err is not null || outcome != ProcessThrottle.RecoverOutcome.Gone && outcome != ProcessThrottle.RecoverOutcome.Restored)
                 FileLogger.Write($"pid={pid} final recover: outcome={outcome}" + (err is null ? "" : $", {err}"));
-            goneUntil[pid] = now.AddSeconds(everSampled ? ReadoptCooldownSec : DeniedCooldownSec);
+            var deniedCooldown = elevated ? DeniedCooldownElevatedSec : DeniedCooldownSec;
+            goneUntil[pid] = now.AddSeconds(everSampled ? ReadoptCooldownSec : deniedCooldown);
             if (!everSampled)
-                FileLogger.Write($"pid={pid} was never observable (access denied?) - re-adoption backed off {DeniedCooldownSec:F0}s; run elevated to observe SYSTEM scanners");
+                FileLogger.Write($"pid={pid} was never observable (access denied?) - re-adoption backed off {deniedCooldown:F0}s" +
+                                 (elevated ? "" : "; run elevated to observe SYSTEM scanners"));
             monitor.ScannerGone(pid, now);
         }
 
@@ -302,27 +317,34 @@ void SetEnabled(bool enabled)
 // ---------------- background worker: all discovery/sampling off the UI thread ----------------
 void WorkerLoop()
 {
-    var lastTick = DateTimeOffset.UtcNow;
-    var lastTrim = DateTimeOffset.UtcNow - MemoryMaintenance.TrimInterval; // first trim soon after startup
+    var lastTick = DateTimeOffset.Now;
+    var lastTrim = DateTimeOffset.Now - MemoryMaintenance.TrimInterval; // first trim soon after startup
     while (true)
     {
         Thread.Sleep(500);
         try
         {
-            var now = DateTimeOffset.UtcNow;
+            // local time, not UTC: this timestamp flows into SessionMonitor
+            // (session files, summary 会话开始/游戏运行 lines) - the summary
+            // used to print UTC bare, 8h early for a UTC+8 user (field report
+            // 2026-11-17). Deltas are offset-independent, so nothing else
+            // changes.
+            var now = DateTimeOffset.Now;
             var dt = (now - lastTick).TotalSeconds;
             lastTick = now;
 
             // resident-process housekeeping: compact the heap and drop the
-            // working set back so a days-long tray session does not creep up
+            // working set back so a days-long tray session does not creep up.
+            // NOT logged per-trim: v0.4.4 logged every trim (~30s cadence) and
+            // 93-98% of log.txt became trim lines, drowning every real event.
+            // Speak up only when the working set is unexpectedly large.
             if (now - lastTrim >= MemoryMaintenance.TrimInterval)
             {
-                var before = MemoryMaintenance.WorkingSetMB();
                 MemoryMaintenance.Trim();
-                var after = MemoryMaintenance.WorkingSetMB();
-                if (before >= 0 && after >= 0 && before - after >= 5)
-                    FileLogger.Write($"memory trimmed: working set {before}MB -> {after}MB");
                 lastTrim = now;
+                var ws = MemoryMaintenance.WorkingSetMB();
+                if (ws > 100)
+                    FileLogger.Write($"working set {ws}MB after trim - unexpected growth, something is leaking");
             }
 
             var fg = ForegroundMonitor.IsForegroundBusy();
