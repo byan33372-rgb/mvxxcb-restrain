@@ -235,7 +235,13 @@ public sealed class SchedulerStateMachine
         _throttledSeconds = 0;
         _burstRun = 0;
         _quietRun = 0;
-        _quietProbeRun = 0;
+        // NOTE: _quietProbeRun must NOT be reset here - the sticky release
+        // counter counts consecutive quiet probe windows and TryThrottle is
+        // called BY the sticky re-arm path itself. Zeroing it here made the
+        // counter restart every cycle, so a finished scan stayed sticky-armed
+        // until the foreground went idle (field 2026-11-21: 489 rethrottles
+        // over 46 min at 0MB/s probe). High-rate probes reset it where it
+        // belongs: at the top of the Probe branch.
         if (kind == "throttle") _throttleCount++;
         _log(new SchedulerEvent(now, kind, mbps, detail));
         return true;
